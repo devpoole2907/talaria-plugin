@@ -1,0 +1,8 @@
+{
+  "name": "talaria",
+  "label": "Talaria Admin",
+  "description": "Admin API for the Talaria iOS app — model switching, session control, and Hermes configuration",
+  "icon": "Zap",
+  "version": "1.0.0",
+  "api": "plugin_api.py"
+}
