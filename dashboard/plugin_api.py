@@ -433,11 +433,19 @@ async def upload_attachment(
         "Talaria: stored attachment %r (%d bytes) id=%s session=%s",
         safe_name, total, upload_id, session_id or "-",
     )
+    # ``stored_path`` is this process's absolute view. When the plugin runs in a
+    # container (HERMES_HOME=/opt/data) but the agent's tools run on the host
+    # (HERMES_HOME=~/.hermes), that absolute path won't resolve for the agent.
+    # ``relative_path`` is the stable handle under HERMES_HOME — the client
+    # references it as ``~/.hermes/<relative_path>`` so the agent finds the file
+    # regardless of the container/host mount mapping.
+    relative_path = f"{_UPLOAD_DIRNAME}/{upload_id}/{safe_name}"
     return {
         "ok": True,
         "id": upload_id,
         "filename": safe_name,
         "stored_path": str(dest_path.resolve()),
+        "relative_path": relative_path,
         "size": total,
         "content_type": getattr(file, "content_type", None),
         "session_id": session_id,
