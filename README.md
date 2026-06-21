@@ -36,6 +36,36 @@ All endpoints live under `/api/plugins/talaria/` on the dashboard port (default 
 | `GET` | `/memory` | Memory config (`enabled`, `user_profile_enabled`, `provider`, `storage_path`) |
 | `GET` | `/config` | Safe config subset (model, agent, terminal, memory, compression, display — secrets redacted) |
 | `POST` | `/session/reset` | Get instructions for creating a fresh session (hint for API clients) |
+| `POST` | `/attachments` | Upload a file (`multipart/form-data`, field `file`; optional `session_id`). Returns `{id, filename, stored_path, size, content_type}` |
+| `GET` | `/attachments/{id}` | Download a previously uploaded file |
+| `DELETE` | `/attachments/{id}` | Delete an uploaded file (the app calls this after the turn is sent) |
+
+---
+
+## File attachments
+
+The Hermes API server (`:8642`) only accepts inline `image_url` parts on
+`/api/sessions/{id}/chat` — uploaded files and document content parts are
+rejected (`unsupported_content_type`). So the app can't attach a PDF or text
+doc through the chat endpoint directly.
+
+This plugin bridges that: the app `POST`s the file to `/attachments`, the
+plugin streams it to `HERMES_HOME/talaria_uploads/<id>/<name>` on the Hermes
+host, and returns the absolute `stored_path`. The app then references that path
+in a normal chat turn, and the agent's server-side `read_file` / `web_extract`
+tools read the file (`web_extract` handles PDFs). Images keep using the app's
+inline `image_url` path — this is for documents.
+
+Keeping this in the plugin means a Hermes upgrade only ever touches the plugin,
+never the app. Uploads are capped at 25 MB; filenames are sanitised to a safe
+basename; ids are server-minted UUIDs validated against path traversal.
+
+```shell
+# Upload (cookie-authed, like the other endpoints)
+curl -b cookies.txt -F "file=@report.pdf" -F "session_id=api_123" \
+  http://localhost:9119/api/plugins/talaria/attachments
+# → {"ok":true,"id":"…","filename":"report.pdf","stored_path":"/…/report.pdf","size":12345,"content_type":"application/pdf"}
+```
 
 ---
 

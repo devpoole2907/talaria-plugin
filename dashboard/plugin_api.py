@@ -3,30 +3,45 @@
 Mounted at /api/plugins/talaria/ by the Hermes dashboard plugin system.
 
 Endpoints:
-  GET  /status    — agent health + current config summary
-  GET  /model     — read current model
-  POST /model     — switch model (persisted to config.yaml)
-  POST /session/reset — reset/clear active session
-  GET  /tools     — list toolsets and their enabled state
-  POST /tools     — enable/disable a toolset
-  GET  /skills    — list installed skills
-  GET  /memory    — read memory usage/info
-  POST /memory    — clear memory
+  GET    /status      — agent health + current config summary
+  GET    /model       — read current model
+  POST   /model       — switch model (persisted to config.yaml)
+  POST   /session/reset — reset/clear active session
+  GET    /tools       — list toolsets and their enabled state
+  POST   /tools       — enable/disable a toolset
+  GET    /skills      — list installed skills
+  GET    /memory      — read memory usage/info
+  POST   /memory      — clear memory
+  POST   /attachments — upload a file; returns its on-disk path for the agent
+  GET    /attachments/{id} — download a previously uploaded file
+  DELETE /attachments/{id} — delete an uploaded file
 """
 
 from __future__ import annotations
 
 import logging
+import re
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
 try:
-    from fastapi import APIRouter, HTTPException, Query, status as http_status
+    from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status as http_status
+    from fastapi.responses import FileResponse
 except Exception:
     class APIRouter:  # type: ignore
         def get(self, *_args, **_kwargs): return lambda fn: fn
         def post(self, *_args, **_kwargs): return lambda fn: fn
+        def delete(self, *_args, **_kwargs): return lambda fn: fn
     class HTTPException(Exception): pass  # type: ignore
+    def File(*_args, **_kwargs): return None  # type: ignore
+    def Form(*_args, **_kwargs): return None  # type: ignore
+    class UploadFile:  # type: ignore
+        filename: str = ""
+        content_type: str = ""
+    class FileResponse:  # type: ignore
+        def __init__(self, *_args, **_kwargs): ...
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -310,3 +325,143 @@ def get_full_config():
             safe[section] = section_data
 
     return {"config": safe}
+
+
+# ──────────────────────────────────────────────
+# Attachments — upload / download / delete
+# ──────────────────────────────────────────────
+#
+# Why this lives in the plugin:
+#   The Hermes API server (port 8642) rejects file/document content parts —
+#   only inline ``image_url`` parts are accepted on /api/sessions/{id}/chat.
+#   So the Talaria app can't attach a PDF/text doc through the chat endpoint.
+#
+# How it works:
+#   The app uploads a document here. We stream it to the Hermes host's
+#   filesystem and return the absolute ``stored_path``. The app then references
+#   that path in a normal chat turn, and the agent's server-side ``read_file`` /
+#   ``web_extract`` tools ingest the file. Images keep using the app's inline
+#   image_url path; this endpoint is for documents.
+#
+#   Keeping this in the plugin means a Hermes upgrade only ever touches the
+#   plugin — the app's upload contract stays put.
+
+_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB — covers PDFs, docs, images
+_UPLOAD_DIRNAME = "talaria_uploads"
+_UPLOAD_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+
+
+def _uploads_root() -> Path:
+    """Return (and create) the per-host upload directory under HERMES_HOME."""
+    root = _get_hermes_home() / _UPLOAD_DIRNAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _safe_attachment_name(raw: str) -> str:
+    """Reduce a client-supplied filename to a safe basename.
+
+    Collapses any directory components so ``../../etc/passwd`` becomes its
+    leaf, drops control characters and leading dots, and caps the length.
+    The result is only ever joined under a freshly-created upload dir.
+    """
+    name = (raw or "").replace("\\", "/").split("/")[-1].strip()
+    name = "".join(ch for ch in name if ch.isprintable() and ch != "\x00").strip()
+    name = name.lstrip(".").strip()
+    if not name:
+        name = "attachment"
+    return name[:200]
+
+
+def _resolve_upload_dir(upload_id: str) -> Path:
+    """Map a client-supplied id to its upload dir, rejecting traversal.
+
+    The id is always a bare 32-char uuid hex we minted — anything with a path
+    separator or wrong shape is rejected before touching the filesystem.
+    """
+    if not isinstance(upload_id, str) or not _UPLOAD_ID_RE.match(upload_id):
+        raise HTTPException(status_code=400, detail="invalid attachment id")
+    root = _uploads_root().resolve()
+    target = (root / upload_id).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid attachment id")
+    return target
+
+
+@router.post("/attachments")
+async def upload_attachment(
+    file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
+):
+    """Store an uploaded file and return its absolute on-disk path.
+
+    The blob lands under ``HERMES_HOME/talaria_uploads/<id>/<name>``. The app
+    passes the returned ``stored_path`` to the agent in a chat turn so
+    ``read_file`` / ``web_extract`` can read it.
+    """
+    safe_name = _safe_attachment_name(getattr(file, "filename", "") or "")
+    upload_id = uuid.uuid4().hex
+    dest_dir = _uploads_root() / upload_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / safe_name
+
+    total = 0
+    try:
+        with open(dest_path, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_ATTACHMENT_BYTES:
+                    out.close()
+                    shutil.rmtree(dest_dir, ignore_errors=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"attachment exceeds {_MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        raise
+    except OSError as exc:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
+
+    log.info(
+        "Talaria: stored attachment %r (%d bytes) id=%s session=%s",
+        safe_name, total, upload_id, session_id or "-",
+    )
+    return {
+        "ok": True,
+        "id": upload_id,
+        "filename": safe_name,
+        "stored_path": str(dest_path.resolve()),
+        "size": total,
+        "content_type": getattr(file, "content_type", None),
+        "session_id": session_id,
+    }
+
+
+@router.get("/attachments/{upload_id}")
+def download_attachment(upload_id: str):
+    """Serve a previously uploaded file (round-trip / verification)."""
+    dest_dir = _resolve_upload_dir(upload_id)
+    if not dest_dir.is_dir():
+        raise HTTPException(status_code=404, detail="attachment not found")
+    files = [p for p in dest_dir.iterdir() if p.is_file()]
+    if not files:
+        raise HTTPException(status_code=404, detail="attachment file missing on disk")
+    blob = files[0]
+    return FileResponse(path=str(blob), filename=blob.name)
+
+
+@router.delete("/attachments/{upload_id}")
+def delete_attachment(upload_id: str):
+    """Delete an uploaded file. The app calls this after the turn is sent."""
+    dest_dir = _resolve_upload_dir(upload_id)
+    existed = dest_dir.is_dir()
+    shutil.rmtree(dest_dir, ignore_errors=True)
+    log.info("Talaria: deleted attachment id=%s existed=%s", upload_id, existed)
+    return {"ok": True, "deleted": existed, "id": upload_id}
