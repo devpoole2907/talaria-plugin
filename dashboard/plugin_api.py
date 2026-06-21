@@ -500,6 +500,23 @@ def delete_attachment(upload_id: str):
 # and never needs a release to track a Hermes change.
 
 
+def _import_web_server():
+    """Import the dashboard module, surfacing any failure as a clean 501.
+
+    Catches BaseException (not just Exception) because a fresh import of
+    web_server can raise SystemExit/argparse exits if it runs in a process that
+    didn't already load it.
+    """
+    try:
+        from hermes_cli import web_server
+        return web_server
+    except BaseException as exc:  # noqa: BLE001 — SystemExit et al. must not 500
+        raise HTTPException(
+            status_code=501,
+            detail=f"dashboard module unavailable: {type(exc).__name__}: {exc}",
+        )
+
+
 def _ds_handler(name: str):
     """Resolve a dashboard handler function by name.
 
@@ -507,10 +524,7 @@ def _ds_handler(name: str):
     expose the expected handler, so the app can detect a version mismatch and
     degrade gracefully instead of crashing.
     """
-    try:
-        from hermes_cli import web_server
-    except Exception as exc:  # dashboard module not importable
-        raise HTTPException(status_code=501, detail=f"dashboard module unavailable: {exc}")
+    web_server = _import_web_server()
     fn = getattr(web_server, name, None)
     if fn is None or not callable(fn):
         raise HTTPException(
@@ -518,6 +532,35 @@ def _ds_handler(name: str):
             detail=f"dashboard handler '{name}' is not available in this Hermes version",
         )
     return fn
+
+
+@router.get("/admin/_diag")
+def admin_diag():
+    """Diagnostic: report whether the dashboard handlers are reachable in-process.
+
+    Lets us tell a misconfigured/cross-process deployment apart from a code bug
+    without needing container logs.
+    """
+    import os
+    import sys
+    info = {"pid": os.getpid(), "web_server_in_sys_modules": "hermes_cli.web_server" in sys.modules}
+    try:
+        web_server = _import_web_server()
+        info["import"] = "ok"
+        wanted = [
+            "get_model_info", "get_model_options", "set_model_assignment",
+            "get_config", "get_skills", "get_toolsets", "ModelAssignment",
+        ]
+        info["handlers_found"] = {n: callable(getattr(web_server, n, None)) for n in wanted}
+        try:
+            mi = web_server.get_model_info(profile=None)
+            info["get_model_info_call"] = {"ok": True, "model": mi.get("model") if isinstance(mi, dict) else str(type(mi))}
+        except BaseException as exc:  # noqa: BLE001
+            info["get_model_info_call"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    except HTTPException as exc:
+        info["import"] = "failed"
+        info["detail"] = exc.detail
+    return info
 
 
 @router.get("/admin/model/info")
