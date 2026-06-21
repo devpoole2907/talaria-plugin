@@ -3,6 +3,6 @@
   "label": "Talaria Admin",
   "description": "Admin API for the Talaria iOS app — model switching, session control, file attachments, and Hermes configuration",
   "icon": "Zap",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "api": "plugin_api.py"
 }

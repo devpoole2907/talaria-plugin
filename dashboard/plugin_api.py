@@ -15,6 +15,16 @@ Endpoints:
   POST   /attachments — upload a file; returns its on-disk path for the agent
   GET    /attachments/{id} — download a previously uploaded file
   DELETE /attachments/{id} — delete an uploaded file
+  GET    /admin/model/info    — current model metadata (delegates to dashboard)
+  GET    /admin/model/options — provider/model picker catalog (delegates)
+  POST   /admin/model/set     — switch model (delegates)
+  GET    /admin/config        — full runtime config (delegates)
+  GET    /admin/skills        — installed skills + enabled state (delegates)
+  GET    /admin/toolsets      — configurable toolsets + state (delegates)
+
+The /admin/* endpoints are stable-path wrappers over the dashboard's own
+handlers so the iOS app depends on this plugin, not un-versioned dashboard
+routes — see the "Admin facade" section below.
 """
 
 from __future__ import annotations
@@ -27,7 +37,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 try:
-    from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status as http_status
+    from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile, status as http_status
     from fastapi.responses import FileResponse
 except Exception:
     class APIRouter:  # type: ignore
@@ -35,6 +45,7 @@ except Exception:
         def post(self, *_args, **_kwargs): return lambda fn: fn
         def delete(self, *_args, **_kwargs): return lambda fn: fn
     class HTTPException(Exception): pass  # type: ignore
+    def Body(*_args, **_kwargs): return None  # type: ignore
     def File(*_args, **_kwargs): return None  # type: ignore
     def Form(*_args, **_kwargs): return None  # type: ignore
     class UploadFile:  # type: ignore
@@ -473,3 +484,86 @@ def delete_attachment(upload_id: str):
     shutil.rmtree(dest_dir, ignore_errors=True)
     log.info("Talaria: deleted attachment id=%s existed=%s", upload_id, existed)
     return {"ok": True, "deleted": existed, "id": upload_id}
+
+
+# ──────────────────────────────────────────────
+# Admin facade — stable-path wrappers over the dashboard's own handlers
+# ──────────────────────────────────────────────
+#
+# The app talks to these instead of the raw dashboard routes (/api/model/*,
+# /api/config, /api/skills, /api/tools/toolsets). Each delegates to the *exact*
+# function the dashboard route uses (the plugin runs in the same process), so
+# responses are byte-identical and the app's decoders never change — but the
+# path the app depends on lives here, under our control. If a Hermes upgrade
+# renames a dashboard route, only this plugin changes; if it renames a handler,
+# we adjust the lookup in `_ds_handler` once. Either way the app is insulated
+# and never needs a release to track a Hermes change.
+
+
+def _ds_handler(name: str):
+    """Resolve a dashboard handler function by name.
+
+    Returns a clear 501 (rather than a 500) when this Hermes version doesn't
+    expose the expected handler, so the app can detect a version mismatch and
+    degrade gracefully instead of crashing.
+    """
+    try:
+        from hermes_cli import web_server
+    except Exception as exc:  # dashboard module not importable
+        raise HTTPException(status_code=501, detail=f"dashboard module unavailable: {exc}")
+    fn = getattr(web_server, name, None)
+    if fn is None or not callable(fn):
+        raise HTTPException(
+            status_code=501,
+            detail=f"dashboard handler '{name}' is not available in this Hermes version",
+        )
+    return fn
+
+
+@router.get("/admin/model/info")
+def admin_model_info(profile: Optional[str] = None):
+    """Resolved current-model metadata — delegates to dashboard get_model_info."""
+    return _ds_handler("get_model_info")(profile=profile)
+
+
+@router.get("/admin/model/options")
+def admin_model_options(refresh: bool = False, profile: Optional[str] = None):
+    """Provider/model picker catalog — delegates to dashboard get_model_options."""
+    return _ds_handler("get_model_options")(profile=profile, refresh=refresh)
+
+
+@router.post("/admin/model/set")
+async def admin_model_set(payload: dict = Body(...), profile: Optional[str] = None):
+    """Switch the model — delegates to dashboard set_model_assignment.
+
+    Accepts the same body as /api/model/set: {scope, provider, model, task?,
+    base_url?}. Persisted to config.yaml; applies to new sessions.
+    """
+    try:
+        from hermes_cli.web_server import ModelAssignment
+    except Exception as exc:
+        raise HTTPException(status_code=501, detail=f"ModelAssignment unavailable: {exc}")
+    set_fn = _ds_handler("set_model_assignment")
+    try:
+        assignment = ModelAssignment(**payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid model assignment: {exc}")
+    return await set_fn(assignment, profile=profile)
+
+
+@router.get("/admin/config")
+async def admin_config(profile: Optional[str] = None):
+    """Full runtime config — delegates to dashboard get_config."""
+    return await _ds_handler("get_config")(profile=profile)
+
+
+@router.get("/admin/skills")
+async def admin_skills(profile: Optional[str] = None):
+    """Installed skills with enabled state — delegates to dashboard get_skills."""
+    return await _ds_handler("get_skills")(profile=profile)
+
+
+@router.get("/admin/toolsets")
+async def admin_toolsets(profile: Optional[str] = None):
+    """Configurable toolsets with enabled/available state — delegates to get_toolsets."""
+    return await _ds_handler("get_toolsets")(profile=profile)
