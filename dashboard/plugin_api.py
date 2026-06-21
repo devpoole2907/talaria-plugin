@@ -29,6 +29,7 @@ routes — see the "Admin facade" section below.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import shutil
@@ -534,45 +535,83 @@ def _ds_handler(name: str):
     return fn
 
 
-@router.get("/admin/_diag")
-def admin_diag():
-    """Diagnostic: report whether the dashboard handlers are reachable in-process.
+def _accepted_kwargs(fn, kwargs: dict) -> dict:
+    """Filter kwargs to only those the target function actually accepts.
 
-    Lets us tell a misconfigured/cross-process deployment apart from a code bug
-    without needing container logs.
+    Hermes handler signatures drift across versions (e.g. some `get_model_info`
+    builds take `profile`, others don't). Passing an unsupported kwarg raises
+    TypeError → a 500. Introspecting and passing only accepted names makes the
+    facade resilient to those signature changes — the whole point of the facade.
     """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+async def _delegate(name: str, *args, **kwargs):
+    """Call a dashboard handler with only the kwargs it supports.
+
+    Handles both sync and async handlers uniformly (older builds expose some of
+    these as plain functions, newer ones as coroutines).
+    """
+    fn = _ds_handler(name)
+    result = fn(*args, **_accepted_kwargs(fn, kwargs))
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+@router.get("/admin/_diag")
+async def admin_diag():
+    """Diagnostic: report whether the dashboard handlers are reachable in-process
+    and which signatures they expose. Useful when a Hermes upgrade shifts them."""
     import os
     import sys
-    info = {"pid": os.getpid(), "web_server_in_sys_modules": "hermes_cli.web_server" in sys.modules}
+    info: dict = {
+        "pid": os.getpid(),
+        "web_server_in_sys_modules": "hermes_cli.web_server" in sys.modules,
+    }
     try:
         web_server = _import_web_server()
-        info["import"] = "ok"
-        wanted = [
-            "get_model_info", "get_model_options", "set_model_assignment",
-            "get_config", "get_skills", "get_toolsets", "ModelAssignment",
-        ]
-        info["handlers_found"] = {n: callable(getattr(web_server, n, None)) for n in wanted}
-        try:
-            mi = web_server.get_model_info(profile=None)
-            info["get_model_info_call"] = {"ok": True, "model": mi.get("model") if isinstance(mi, dict) else str(type(mi))}
-        except BaseException as exc:  # noqa: BLE001
-            info["get_model_info_call"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     except HTTPException as exc:
         info["import"] = "failed"
         info["detail"] = exc.detail
+        return info
+    info["import"] = "ok"
+    wanted = [
+        "get_model_info", "get_model_options", "set_model_assignment",
+        "get_config", "get_skills", "get_toolsets", "ModelAssignment",
+    ]
+    sigs = {}
+    for n in wanted:
+        fn = getattr(web_server, n, None)
+        try:
+            sigs[n] = str(inspect.signature(fn)) if callable(fn) else None
+        except (TypeError, ValueError):
+            sigs[n] = "<no signature>"
+    info["handlers"] = sigs
+    try:
+        mi = await _delegate("get_model_info")
+        info["get_model_info_call"] = {"ok": True, "model": mi.get("model") if isinstance(mi, dict) else str(type(mi))}
+    except BaseException as exc:  # noqa: BLE001
+        info["get_model_info_call"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return info
 
 
 @router.get("/admin/model/info")
-def admin_model_info(profile: Optional[str] = None):
+async def admin_model_info(profile: Optional[str] = None):
     """Resolved current-model metadata — delegates to dashboard get_model_info."""
-    return _ds_handler("get_model_info")(profile=profile)
+    return await _delegate("get_model_info", profile=profile)
 
 
 @router.get("/admin/model/options")
-def admin_model_options(refresh: bool = False, profile: Optional[str] = None):
+async def admin_model_options(refresh: bool = False, profile: Optional[str] = None):
     """Provider/model picker catalog — delegates to dashboard get_model_options."""
-    return _ds_handler("get_model_options")(profile=profile, refresh=refresh)
+    return await _delegate("get_model_options", refresh=refresh, profile=profile)
 
 
 @router.post("/admin/model/set")
@@ -582,31 +621,30 @@ async def admin_model_set(payload: dict = Body(...), profile: Optional[str] = No
     Accepts the same body as /api/model/set: {scope, provider, model, task?,
     base_url?}. Persisted to config.yaml; applies to new sessions.
     """
+    web_server = _import_web_server()
+    model_assignment = getattr(web_server, "ModelAssignment", None)
+    if model_assignment is None:
+        raise HTTPException(status_code=501, detail="ModelAssignment unavailable in this Hermes version")
     try:
-        from hermes_cli.web_server import ModelAssignment
-    except Exception as exc:
-        raise HTTPException(status_code=501, detail=f"ModelAssignment unavailable: {exc}")
-    set_fn = _ds_handler("set_model_assignment")
-    try:
-        assignment = ModelAssignment(**payload)
+        assignment = model_assignment(**payload)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"invalid model assignment: {exc}")
-    return await set_fn(assignment, profile=profile)
+    return await _delegate("set_model_assignment", assignment, profile=profile)
 
 
 @router.get("/admin/config")
 async def admin_config(profile: Optional[str] = None):
     """Full runtime config — delegates to dashboard get_config."""
-    return await _ds_handler("get_config")(profile=profile)
+    return await _delegate("get_config", profile=profile)
 
 
 @router.get("/admin/skills")
 async def admin_skills(profile: Optional[str] = None):
     """Installed skills with enabled state — delegates to dashboard get_skills."""
-    return await _ds_handler("get_skills")(profile=profile)
+    return await _delegate("get_skills", profile=profile)
 
 
 @router.get("/admin/toolsets")
 async def admin_toolsets(profile: Optional[str] = None):
     """Configurable toolsets with enabled/available state — delegates to get_toolsets."""
-    return await _ds_handler("get_toolsets")(profile=profile)
+    return await _delegate("get_toolsets", profile=profile)
